@@ -1648,7 +1648,8 @@ def run_eval_manager_tools(
         "tool_counts": tool_counts,
         "malformed_tool_calls": malformed_tool_calls,
         "binding_mode": binding_mode,
-        "subagents": sorted(pool._agents.keys()),
+        # "subagents": sorted(pool._agents.keys()),
+      "subagents": sorted(pool._agents.keys()) if hasattr(pool, '_agents') else ["remote"],
     }
     write_jsonl(os.path.join(ctx.eval_root, "manager_tool_eval.jsonl"), rows_log)
     write_json(os.path.join(ctx.eval_root, "manager_tool_eval_report.json"), report)
