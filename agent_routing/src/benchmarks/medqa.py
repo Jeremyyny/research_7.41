@@ -38,12 +38,12 @@ def _from_record(rec: Dict[str, Any], idx: int, default_split: str) -> Optional[
     if not question or len(choices) < 2:
         return None
 
-    answer_raw = (
-        rec.get("answer_idx")
-        or rec.get("answer")
-        or rec.get("label")
-        or rec.get("answer_label")
-        or rec.get("ground_truth")
+    # First present (non-None) field wins. An `or` chain would skip falsy but
+    # valid values like integer 0 (answer_idx of the first choice).
+    answer_raw = next(
+        (rec[k] for k in ("answer_idx", "answer", "label", "answer_label", "ground_truth")
+         if rec.get(k) is not None and str(rec[k]).strip() != ""),
+        None,
     )
     gt = resolve_mcq_answer(answer_raw, choices)
     if not gt or gt not in choices:

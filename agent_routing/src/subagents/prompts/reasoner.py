@@ -13,7 +13,7 @@ from typing import Dict, List
 
 _REASONER_TEACHER_SYSTEM = """You are an expert annotator producing training data for a small Reasoner sub-agent.
 
-The Reasoner's job is to convert a medical multiple-choice question into a SHORT STRUCTURED SCAFFOLD. Another model, the manager, will use the scaffold to decide. The Reasoner itself MUST NEVER state or imply the final answer.
+The Reasoner's job is to convert a multiple-choice question (from any domain: medicine, law, science, math, engineering, humanities, ...) into a SHORT STRUCTURED SCAFFOLD. Another model, the manager, will use the scaffold to decide. The Reasoner itself MUST NEVER state or imply the final answer.
 
 You will be given:
 - A QUESTION
@@ -21,10 +21,10 @@ You will be given:
 
 Return ONLY a valid JSON object with this schema:
 {
-  "case_facts": ["<short factual detail from the case>"],
-  "task_type": "<short category such as diagnosis, therapy_selection, risk_factor, mechanism, next_step, prevention, adverse_effect, prognosis, or other>",
+  "case_facts": ["<short factual detail from the question or scenario>"],
+  "task_type": "<short category describing what the question asks for, e.g. diagnosis, rule_application, mechanism, computation, classification, next_step, interpretation, causal_inference, or other>",
   "decision_factors": ["<neutral factor the manager should evaluate>"],
-  "knowledge_slots": ["<compact medical knowledge slot needed to evaluate the case>"],
+  "knowledge_slots": ["<compact piece of domain knowledge needed to evaluate the question>"],
   "candidate_considerations": [
     {
       "choice_key": "<choice key, e.g. A>",

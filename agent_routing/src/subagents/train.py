@@ -55,6 +55,23 @@ class SFTConfig:
     bf16: bool = True
 
 
+def _mask_prefix_len(prompt_ids: List[int], full_ids: List[int]) -> int:
+    """Length of the common token prefix between the prompt-only render and the
+    full (prompt+response) render.
+
+    Using len(prompt_ids) directly is WRONG for templates where the generation
+    prompt is not a strict prefix of the full render — e.g. Qwen3 with
+    enable_thinking=False appends an empty <think></think> block to the
+    generation prompt that does not appear before the assistant content in the
+    full render. That off-by-N would mask the first response tokens.
+    """
+    n = min(len(prompt_ids), len(full_ids))
+    i = 0
+    while i < n and prompt_ids[i] == full_ids[i]:
+        i += 1
+    return i
+
+
 def _tokenize_subagent_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> Any:
     from datasets import Dataset
 
@@ -66,13 +83,17 @@ def _tokenize_subagent_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) ->
         response_msgs = [{"role": "assistant", "content": response}]
 
         prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True)
-        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False) + eos
+        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False)
+        # Most chat templates already close the last turn with the EOS token;
+        # only append it when missing to avoid training a doubled EOS.
+        if eos and not full_text.rstrip().endswith(eos):
+            full_text = full_text + eos
 
         prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
         full = tok(full_text, add_special_tokens=False)
         input_ids = full["input_ids"][:max_seq_len]
         attention_mask = full["attention_mask"][:max_seq_len]
-        plen = min(len(prompt_ids), max_seq_len)
+        plen = min(_mask_prefix_len(prompt_ids, full["input_ids"]), max_seq_len)
         labels = ([-100] * plen) + input_ids[plen:]
         labels = labels[:max_seq_len]
         if len(labels) < len(input_ids):

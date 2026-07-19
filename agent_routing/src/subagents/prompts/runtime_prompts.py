@@ -27,7 +27,7 @@ Given a question (and optional choices and context), extract decision-relevant s
 Rules:
 - Output ONLY valid JSON, no extra text.
 - Do NOT state the final answer.
-- If context is empty, key_evidence=[] and use extracted_facts for clinical/factual elements pulled from the question stem.
+- If context is empty, key_evidence=[] and use extracted_facts for concrete factual elements (entities, quantities, conditions) pulled from the question stem.
 - Treat all answer choices fairly; do not favor any one.
 """
 

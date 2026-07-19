@@ -136,7 +136,11 @@ def _ensure_list(x: Any, n: int) -> List[Any]:
             return x
         if not x:
             return [None] * n
-        return (x * ((n // len(x)) + 1))[:n]
+        # A silently cycled/truncated column would misalign rewards with
+        # completions — fail loudly instead.
+        raise ValueError(
+            f"reward column length mismatch: got {len(x)} values for {n} completions"
+        )
     return [x] * n
 
 
@@ -440,18 +444,20 @@ def build_reward_funcs(
         ground_truth=None,
         example_id=None,
         choice_keys=None,
+        question_hash=None,
         **kwargs,
     ) -> List[float]:
         n     = len(completions)
         gts   = _ensure_list(ground_truth, n)
         eids  = _ensure_list(example_id, n)
         ck_lists = _ensure_list(choice_keys, n)
+        qhashes = _ensure_list(question_hash, n)
 
         rewards: List[float] = []
         fail_rows:  List[Dict[str, Any]] = []
         trace_rows: List[Dict[str, Any]] = []
 
-        for c, gt, eid, keys in zip(completions, gts, eids, ck_lists):
+        for c, gt, eid, keys, qh in zip(completions, gts, eids, ck_lists, qhashes):
             stats    = _extract_completion_stats(c)
             keys_list = list(keys) if isinstance(keys, (list, tuple)) else []
             pred     = parse_final_answer(stats["last_assistant_text"], keys_list)
@@ -503,6 +509,9 @@ def build_reward_funcs(
                 fail_rows.append({
                     "ts": int(time.time()),
                     "example_id": int(eid) if eid is not None else None,
+                    # question_hash survives normalized-cache rebuilds;
+                    # example_id does not (see benchmarks/base.py).
+                    "question_hash": qh,
                     "ground_truth": gt,
                     "pred": pred,
                     "valid_format": bool(valid_format),
@@ -518,6 +527,7 @@ def build_reward_funcs(
                 trace_entry: Dict[str, Any] = {
                     "ts": int(time.time()),
                     "example_id": int(eid) if eid is not None else None,
+                    "question_hash": qh,
                     "ground_truth": gt,
                     "pred": pred,
                     "correct": bool(base_correct),

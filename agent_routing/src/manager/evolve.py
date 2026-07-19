@@ -88,7 +88,7 @@ def _teacher_choose_tool_sequence(
         return seq[:3]
 
     sys_msg = (
-        "You design tool-use plans for a manager agent that must solve MMLU-Pro questions.\n"
+        "You design tool-use plans for a manager agent that must solve multiple-choice questions.\n"
         f"Available tools: {available_tools}.\n"
         "Choose a sequence of 0 to 3 tools (no repeats) to create DIVERSE, HIGH-QUALITY training data.\n"
         "Guidelines:\n"
@@ -225,7 +225,19 @@ def _build_manager_tool_sft_rows(
     binding_mode: str,
     task_description: str,
     cache_namespace: str,
+    initial_draft_by_eid: Optional[Dict[int, str]] = None,
 ) -> List[Dict[str, Any]]:
+    """Build per-turn manager SFT trajectories.
+
+    initial_draft_by_eid: optional map example_id -> choice key used as the
+    manager's stated draft on tool-calling turns (e.g. the manager's actual
+    failed prediction from the GRPO fail buffer). The final turn always states
+    the corrected GT draft + answer, so the trace teaches a W→C revision.
+    When absent, drafts default to the GT (plain teacher forcing).
+    The verifier is asked to audit the draft actually stated at that turn —
+    never the raw ground truth — so verifier tool outputs in training traces
+    match what the frozen verifier will see at inference time.
+    """
     try:
         from tqdm import tqdm
         _iter = tqdm(rows, desc=f"[{cache_namespace}] building SFT rows", unit="ex")
@@ -262,6 +274,13 @@ def _build_manager_tool_sft_rows(
             fallback_seq=fallback_seq,
         )
 
+        # Draft stated on tool-calling turns: the manager's actual (possibly
+        # wrong) prediction when known, else the GT. The final turn always
+        # corrects to GT.
+        initial_draft = (initial_draft_by_eid or {}).get(eid, "")
+        if initial_draft not in row.choices:
+            initial_draft = row.ground_truth
+
         tool_outputs: Dict[str, str] = {}
         for tname in seq:
             kind = _TOOL_NAME_TO_KIND[tname]
@@ -274,11 +293,12 @@ def _build_manager_tool_sft_rows(
                 context=row.context,
                 choices=row.choices,
                 cache_namespace=cache_namespace,
-                candidate_answer=(row.ground_truth if kind == "verifier" else ""),
+                candidate_answer=(initial_draft if kind == "verifier" else ""),
             )
 
         final_text = _final_answer_str(row.ground_truth)
         draft_text = _draft_answer_str(row.ground_truth)
+        turn_draft_text = _draft_answer_str(initial_draft)
         qhash = _question_hash(row.question)
         if not seq:
             sft_rows.append({
@@ -293,11 +313,11 @@ def _build_manager_tool_sft_rows(
         for i, tname in enumerate(seq):
             call_id = f"call_{eid}_{i+1}"
             # ADC policy: every tool-calling turn states the current draft answer;
-            # verifier calls pass the draft so it audits that hypothesis.
-            extra_args = {"current_draft": row.ground_truth} if tname == "verifier_tool" else None
+            # verifier calls pass that same draft so it audits that hypothesis.
+            extra_args = {"current_draft": initial_draft} if tname == "verifier_tool" else None
             asst_call = _tool_call_message(
                 tname, eid, call_id, binding_mode,
-                content=draft_text, extra_args=extra_args,
+                content=turn_draft_text, extra_args=extra_args,
             )
             sft_rows.append({
                 "example_id": eid,
@@ -346,30 +366,51 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
     )
 
     row_index = {int(r.example_id): r for r in cfg.rows}
+    # example_id values silently change whenever a normalized cache is rebuilt
+    # (see benchmarks/base.py). Prefer question_hash matching when the fail
+    # buffer carries it; fall back to example_id for older buffers.
+    row_by_hash = {_question_hash(r.question): r for r in cfg.rows}
 
-    # Read failures, dedupe by example_id, cap.
+    # Read failures, dedupe per example, cap. Also collect the manager's
+    # failed prediction so the SFT trace can state it as the initial draft.
     fails: List[int] = []
     seen = set()
+    initial_draft_by_eid: Dict[int, str] = {}
+    n_id_fallback = 0
     if not os.path.exists(cfg.fail_buffer_jsonl):
         raise FileNotFoundError(f"fail_buffer not found: {cfg.fail_buffer_jsonl}")
     for row in read_jsonl(cfg.fail_buffer_jsonl):
-        eid = row.get("example_id")
-        if eid is None:
+        matched: Optional[StandardRow] = None
+        qh = row.get("question_hash")
+        if qh:
+            matched = row_by_hash.get(str(qh))
+        if matched is None:
+            try:
+                matched = row_index.get(int(row.get("example_id")))
+                if matched is not None and qh:
+                    # hash present but unknown -> row not in cfg.rows; skip
+                    matched = None
+                elif matched is not None:
+                    n_id_fallback += 1
+            except Exception:
+                matched = None
+        if matched is None:
             continue
-        try:
-            eid = int(eid)
-        except Exception:
-            continue
+        eid = int(matched.example_id)
         if eid in seen:
-            continue
-        if eid not in row_index:
             continue
         seen.add(eid)
         fails.append(eid)
+        pred = row.get("pred")
+        if isinstance(pred, str) and pred in matched.choices:
+            initial_draft_by_eid[eid] = pred
         if len(fails) >= cfg.max_fail_samples:
             break
 
-    print(f"[EVOLVE] {len(fails)} unique failed example_ids selected from buffer.")
+    print(
+        f"[EVOLVE] {len(fails)} unique failed examples selected from buffer "
+        f"(example_id fallback matches: {n_id_fallback})."
+    )
 
     selected_rows = [row_index[eid] for eid in fails]
     sft_rows = _build_manager_tool_sft_rows(
@@ -380,6 +421,7 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
         binding_mode=cfg.binding_mode,
         task_description=cfg.task_description,
         cache_namespace="evolve",
+        initial_draft_by_eid=initial_draft_by_eid,
     )
 
     out_path = os.path.join(cfg.out_dir, "manager_sft_from_failures.jsonl")
@@ -661,6 +703,18 @@ def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
         )
 
 
+def _mask_prefix_len(prompt_ids: List[int], full_ids: List[int]) -> int:
+    """Common token prefix of the prompt-only and full renders. See
+    subagents/train.py: len(prompt_ids) is wrong for templates (e.g. Qwen3 with
+    enable_thinking=False) whose generation prompt is not a strict prefix of
+    the full render — it would mask the first response tokens."""
+    n = min(len(prompt_ids), len(full_ids))
+    i = 0
+    while i < n and prompt_ids[i] == full_ids[i]:
+        i += 1
+    return i
+
+
 def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> Dataset:
     eos = tok.eos_token or ""
 
@@ -673,13 +727,15 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> 
             response_msgs = [{"role": "assistant", "content": response_msgs}]
 
         prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True)
-        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False) + eos
+        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False)
+        if eos and not full_text.rstrip().endswith(eos):
+            full_text = full_text + eos
 
         prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
         full = tok(full_text, add_special_tokens=False)
         input_ids = full["input_ids"][:max_seq_len]
         attention_mask = full["attention_mask"][:max_seq_len]
-        plen = min(len(prompt_ids), max_seq_len)
+        plen = min(_mask_prefix_len(prompt_ids, full["input_ids"]), max_seq_len)
         labels = ([-100] * plen) + input_ids[plen:]
         labels = labels[:max_seq_len]
         if len(labels) < len(input_ids):

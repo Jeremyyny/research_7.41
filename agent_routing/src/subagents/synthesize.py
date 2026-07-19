@@ -253,7 +253,8 @@ def synthesize_subagent_data(
             cached_resp: Optional[Dict[str, Any]] = None
             if cache is not None:
                 cache_key = TeacherCallCache.make_key(
-                    teacher.provider, teacher.model, messages, temperature
+                    teacher.provider, teacher.model, messages, temperature,
+                    max_tokens=_agent_default_max_tokens(agent_kind),
                 )
                 cached_resp = cache.get(cache_key)
 
@@ -343,6 +344,7 @@ def synthesize_subagent_data(
                 ground_truth_text=kw["ground_truth_text"],
                 token_form=kw["token_form"],
                 extra_keywords=extra_kws,
+                all_choice_texts=list(row.choices.values()),
             )
             if audit.leaked:
                 with _lock:

@@ -28,17 +28,19 @@ class TeacherCallCache:
         model: str,
         messages: List[Dict[str, str]],
         temperature: float,
+        max_tokens: Optional[int] = None,
     ) -> str:
-        payload = json.dumps(
-            {
-                "provider": provider,
-                "model": model,
-                "messages": messages,
-                "temperature": round(float(temperature), 4),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        obj: Dict[str, Any] = {
+            "provider": provider,
+            "model": model,
+            "messages": messages,
+            "temperature": round(float(temperature), 4),
+        }
+        # Included so a raised token budget re-generates instead of returning a
+        # stale truncated response. None keeps legacy keys valid.
+        if max_tokens is not None:
+            obj["max_tokens"] = int(max_tokens)
+        payload = json.dumps(obj, ensure_ascii=False, sort_keys=True)
         return _hash(payload)
 
     def _path(self, key: str) -> str:

@@ -3,10 +3,10 @@
 Design intent:
   - Extractor's job is OBJECTIVE evidence/fact extraction.
   - We do NOT show the teacher the ground truth label or the GT choice text.
-    Reason: leakage avCUD3909oidance + we want the teacher to surface evidence on
+    Reason: leakage avoidance + we want the teacher to surface evidence on
     BOTH sides (support and oppose), not only pro-GT evidence.
-  - For MedQA (closed-book MCQ with empty context), we pivot the agent's
-    role to "extract clinical facts from the question stem itself".
+  - For closed-book MCQ with empty context (e.g. MedQA, GPQA), we pivot the
+    agent's role to "extract concrete facts from the question stem itself".
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ CRITICAL RULES:
 1. Output ONLY valid JSON. No prose, no markdown fences.
 2. Do NOT state, hint, or imply which answer choice is correct.
 3. When choices are present, your evidence and facts must be useful for evaluating ALL choices, not selectively favor any one.
-4. If context is empty (closed-book), set key_evidence=[] and use extracted_facts to enumerate concrete pieces of information FROM THE QUESTION STEM (e.g. "patient age 45", "blood pressure 160/95", "presents with chest pain").
+4. If context is empty (closed-book), set key_evidence=[] and use extracted_facts to enumerate concrete pieces of information FROM THE QUESTION STEM (e.g. "patient age 45", "contract was signed before delivery", "reaction occurs at 300 K", "array is sorted in ascending order").
 5. extracted_facts entries must be self-contained and de-contextualized (a separate agent will read them without seeing the original question).
 6. Polarity is relative to the QUESTION's directional claim, not to any choice. If unclear, use "neutral".
 7. Keep each text field under the schema's character limits.

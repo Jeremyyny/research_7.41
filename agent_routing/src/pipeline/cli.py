@@ -785,7 +785,6 @@ def main() -> None:
             task_description=args.task_description,
             sc_k=args.eval_sc_k,
             sc_temperature=args.eval_sc_temperature,
-          subagent_server_url=(args.subagent_server_url or None), 
         )
         print("[EVAL_MANAGER]", result)
         return
@@ -803,7 +802,7 @@ def main() -> None:
             max_new_tokens=args.eval_max_new_tokens,
             task_description=args.task_description,
             out_tag=args.eval_out_tag,
-          subagent_server_url=(args.subagent_server_url or None), 
+            subagent_server_url=(args.subagent_server_url or None),
         )
         print("[EVAL_MANAGER_FORCED]", result)
         return
@@ -817,7 +816,7 @@ def main() -> None:
             max_new_tokens=args.eval_max_new_tokens,
             max_tool_calls=args.eval_max_tool_calls,
             task_description=args.task_description,
-          subagent_server_url=(args.subagent_server_url or None), 
+            subagent_server_url=(args.subagent_server_url or None),
         )
         print("[EVAL_MANAGER_TOOLS]", result)
         return

@@ -65,8 +65,10 @@ class LeakageAuditor:
             if any(p.search(t) for p in SAFE_TEMPLATE_PATTERNS):
                 return hits
             for kw in keywords:
-                # Word-ish boundary match. Loose by design.
-                if kw and kw in t:
+                # Whole-word/phrase boundary match: raw substring matching
+                # flagged e.g. "yes" inside "yesterday", which both rejects
+                # clean samples and biases the surviving data.
+                if kw and re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", t):
                     hits.append((path or "<root>", kw))
                     break
         return hits
@@ -78,12 +80,27 @@ class LeakageAuditor:
         ground_truth_text: str = "",
         token_form: str = "",
         extra_keywords: Iterable[str] = (),
+        all_choice_texts: Iterable[str] = (),
     ) -> LeakageAuditResult:
+        """Audit a generated object for GT leakage.
+
+        all_choice_texts: full label set of the row (when known). If ANY choice
+        text is too short to audit (< min_keyword_len, e.g. "No" in a Yes/No
+        task), choice-TEXT auditing is skipped for the whole row — otherwise
+        only the long labels get filtered, and "the label never mentioned" in
+        the surviving data becomes a negative-space signal for the answer.
+        The canonical label and ANSWER_<TOKEN> form are always audited.
+        """
+        choice_texts = [self._normalize(str(c)) for c in all_choice_texts if c]
+        skip_choice_text = any(
+            len(c) < self.min_keyword_len for c in choice_texts
+        ) if choice_texts else False
+
         kws = self._build_keywords(
             ground_truth_label=ground_truth_label,
-            ground_truth_text=ground_truth_text,
+            ground_truth_text=("" if skip_choice_text else ground_truth_text),
             token_form=token_form,
-            extra=extra_keywords,
+            extra=(() if skip_choice_text else extra_keywords),
         )
         if not kws:
             return LeakageAuditResult(leaked=False, matches=[])

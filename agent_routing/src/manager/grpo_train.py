@@ -42,7 +42,7 @@ try:
 except Exception:
     HAS_RESP_SCHEMA = False
 
-from ..benchmarks.base import StandardRow
+from ..benchmarks.base import StandardRow, question_hash as _question_hash
 from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
 from ..utils.io import write_json
 from ..utils.seed import set_seed
@@ -351,6 +351,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             ],
             "ground_truth": r.ground_truth,
             "example_id": int(r.example_id),
+            "question_hash": _question_hash(r.question),
             "choice_keys": list(r.choices.keys()),
         }
 

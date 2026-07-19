@@ -90,6 +90,10 @@ def resolve_mcq_answer(raw_answer: Any, choices: Dict[str, str]) -> str:
     if upper in choices:
         return upper
     if raw.isdigit():
+        # AMBIGUOUS for 1 <= idx < len(keys): we assume 0-based indexing (the
+        # HF convention). A 1-based dataset would be silently off by one —
+        # when adding such a source, convert its answers to letter keys in the
+        # loader instead of relying on this fallback.
         idx = int(raw)
         keys = list(choices.keys())
         if 0 <= idx < len(keys):

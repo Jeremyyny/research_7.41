@@ -270,12 +270,15 @@ class RemoteSubagentPool:
             choices=choices,
             candidate_answer=candidate_answer,
         )
+        # NOTE: "extra_body" is an OpenAI *Python SDK* client-side argument, not
+        # an HTTP field. When POSTing raw JSON to vLLM, chat_template_kwargs
+        # must sit at the top level of the payload or thinking is NOT disabled.
         payload = {
             "model": agent_kind,
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": self._max_new_tokens,
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         resp = _requests.post(
             f"{self._server_url}/v1/chat/completions",
