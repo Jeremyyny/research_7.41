@@ -12,13 +12,15 @@ The three advisors are frozen, schema-constrained specialists that provide
 *signals, never answers*; the manager is the sole authority on the final
 `ANSWER_<TOKEN>` line and states a `DRAFT_ANSWER_<TOKEN>` (its current belief)
 in every delegating turn. The stopping policy is trained with GRPO under an
-**anytime-accuracy reward** designed to be incentive-compatible: honestly
-reporting your current best guess is the unique optimal drafting strategy.
+ordinary **binary final-correctness reward**. A counterfactual cold start uses
+the explicit draft to compare `COMMIT` with forced advisor branches and
+imitates a shortest trajectory only when it actually reaches the correct
+answer.
 
 Benchmarks: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
 
-> Paper-experiment matrix (RQ1/RQ2/RQ3 tables, ablation arms, oracle/regret
-> analysis, data-budget rationale): **[EXPERIMENTS.md](EXPERIMENTS.md)**.
+> Current step-by-step protocol: **[MARGINAL_VALUE_EXPERIMENTS.md](MARGINAL_VALUE_EXPERIMENTS.md)**.
+> The older ADC experiment matrix is retained in `EXPERIMENTS.md` for history.
 > This README covers the system + one end-to-end walkthrough per benchmark.
 
 ---
@@ -28,8 +30,8 @@ Benchmarks: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
 ```
                        ┌─────────────────────────────┐
                        │   Manager (Qwen3-8B)        │
-                       │   GRPO + anytime ADC reward │
-                       │   drafts -> delegate/commit │
+                       │ counterfactual SFT + binary │
+                       │ GRPO; drafts route/commit   │
                        └────┬────────┬───────┬───────┘
                             │        │       │ current_draft
               ┌─────────────┘        │       └──────────────┐
@@ -55,22 +57,19 @@ Benchmarks: **MedQA-USMLE**, **LegalBench**, **MMLU-Pro**, **GPQA**.
 - Advisors are frozen, greedy-decoded, and cached per (kind, question) — the
   marginal value of every consultation is deterministic, which makes the
   per-question stopping oracle enumerable (`eval_manager_forced`).
-- Each advisor is callable at most once per episode; each call costs
-  `--mgr_adc_cost_per_tool`.
+- Each advisor is callable at most once per episode.
 
 **The reward**
 
 ```
-R = final_bonus       * 1[final answer correct]
-  + draft_bonus       * (mean correctness of ALL answer statements)   # bounded
-  - missing_draft_pen * max(0, #delegations - #drafts)                # format only
-  - cost_per_tool     * #delegations
+R = 1[final answer correct]
 ```
 
-Two natural alternatives are provably exploitable and exist only as ablation
-arms (`--mgr_adc_variant transition|sum`): transition rewards telescope into
-paying for a deliberately wrong first draft (sandbagging); summed draft
-bonuses are farmable by superfluous delegations. See `src/manager/reward.py`.
+Binary reward alone cannot prefer a shorter trajectory when both trajectories
+are correct. That tie is resolved in counterfactual SFT: correct beats
+incorrect; among correct branches, fewer calls win; wrong/wrong pairs provide
+no no-call supervision. This avoids a global cost that can make never calling
+an absorbing shortcut.
 
 ## Install
 
@@ -135,44 +134,51 @@ python -m src.pipeline.cli eval_subagents \
     --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
     --medqa_normalized_cache "$MEDQA_CACHE" $SPLIT --eval_n_samples 50
 
-# 5) manager cold start (demonstrates DRAFT_ANSWER_ + current_draft)
-python -m src.pipeline.cli manager_coldstart_sft \
-    --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
-    --medqa_normalized_cache "$MEDQA_CACHE" $SPLIT \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl" \
-    --exclude_sft_example_ids "outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl" \
-    --coldstart_n_samples 300 --coldstart_force_diverse \
-    --manager_sft_epochs 2 --manager_sft_lr 5e-6 \
-    --task_description "$TASK_DESC"
-
-# 6) GRPO — terminal A: advisor server on GPU 0
+# 5) terminal A: start the advisor server on GPU 0 (keep it running)
 conda activate vllm_env
 bash scripts/start_subagent_server.sh "$BASE_MODEL" "$TEACHER_ID"
+export SUBAGENT_SERVER_URL="http://localhost:8000"
 
-# 6) GRPO — terminal B: training on GPUs 1-3 (anytime reward, cost 0.05)
+# 6) terminal B: build counterfactual marginal-value routing data on another GPU
+export CUDA_VISIBLE_DEVICES=1
+python -m src.pipeline.cli build_marginal_sft \
+    --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
+    --medqa_normalized_cache "$MEDQA_CACHE" $SPLIT \
+    --mv_manager_dir "$BASE_MODEL" --mv_n_samples 400 --mv_max_depth 1 \
+    --mv_max_commit_rescue_ratio 1.0 \
+    --subagent_server_url "$SUBAGENT_SERVER_URL" \
+    --task_description "$TASK_DESC"
+
+# 7) SFT the manager on verified shortest-success decisions
+python -m src.pipeline.cli train_manager_sft \
+    --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
+    --manager_sft_train_jsonl "outputs/manager/${TEACHER_ID}/marginal_value/manager_sft_marginal.jsonl" \
+    --manager_sft_output_dir "outputs/manager/${TEACHER_ID}/sft_marginal" \
+    --manager_sft_epochs 1 --manager_sft_lr 1e-5
+
+# 8) GRPO — terminal B: binary final correctness only
 EXCL="--exclude_sft_example_ids outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl \
       --exclude_sft_example_ids outputs/sft_data/${TEACHER_ID}/reasoner_sft.jsonl \
       --exclude_sft_example_ids outputs/sft_data/${TEACHER_ID}/verifier_sft.jsonl \
-      --exclude_sft_example_ids outputs/manager/${TEACHER_ID}/evolve/manager_sft_coldstart_diverse.jsonl"
+      --exclude_sft_example_ids outputs/manager/${TEACHER_ID}/marginal_value/counterfactual_records.jsonl"
 bash scripts/train_manager_grpo_multigpu.sh "$TEACHER_ID" \
     --base_model "$BASE_MODEL" \
     --medqa_normalized_cache "$MEDQA_CACHE" $SPLIT $EXCL \
-    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_coldstart" \
-    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_anytime_c05" \
-    --mgr_adc_mode --mgr_adc_variant anytime \
-    --mgr_adc_draft_bonus 0.2 --mgr_adc_missing_draft_penalty 0.1 \
-    --mgr_adc_final_bonus 1.0 --mgr_adc_cost_per_tool 0.05 \
-    --mgr_clip_epsilon_high 0.28 --mgr_max_steps 300 \
+    --mgr_init_adapter "outputs/manager/${TEACHER_ID}/sft_marginal" \
+    --mgr_output_dir "outputs/manager/${TEACHER_ID}/grpo_binary_marginal" \
+    --mgr_routing_efficiency_bonus 0 --mgr_tool_use_bonus 0 \
+    --mgr_grpo_beta 0.05 --mgr_clip_epsilon_high 0.28 --mgr_max_steps 100 \
+    --subagent_server_url "$SUBAGENT_SERVER_URL" \
     --mgr_use_wandb --wandb_project agent_routing \
-    --wandb_run_name "${TEACHER_ID}_anytime_c05" \
+    --wandb_run_name "${TEACHER_ID}_binary_marginal" \
     --task_description "$TASK_DESC"
 
-# 7) eval (learned delegate-or-commit loop, 500 held-out)
+# 9) eval (learned delegate-or-commit loop, 500 held-out)
 python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
     --medqa_normalized_cache "$MEDQA_CACHE" $SPLIT --eval_n_samples 500 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_anytime_c05" \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_binary_marginal" \
+    --subagent_server_url "$SUBAGENT_SERVER_URL" \
     --task_description "$TASK_DESC"
 ```
 
@@ -187,7 +193,7 @@ python -m src.pipeline.cli eval_manager_tools \
     --legalbench_configs "abercrombie,hearsay,personal_jurisdiction,proa,successor_liability" \
     --legalbench_normalized_cache outputs/data/legalbench_5tasks.jsonl \
     --train_size 0 --dev_size 0 --test_size 400 --eval_n_samples 400 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_anytime_c05" \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_binary_marginal" \
     --task_description "You are a manager agent solving LegalBench legal classification tasks."
 # report per task: filter the eval jsonl by task_subtype
 ```
@@ -202,8 +208,8 @@ export LB="--legalbench_configs abercrombie,hearsay,personal_jurisdiction,proa,s
 export LB_SPLIT="--train_size 240 --dev_size 50 --test_size 95"
 export LB_DESC="You are a manager agent solving LegalBench legal classification tasks."
 # step 2: --n_samples 120        (per advisor)
-# step 5: --coldstart_n_samples 60
-# step 6: --mgr_max_steps 60 --mgr_grpo_beta 0.02   (tiny GRPO pool ~50 rows; watch for overfit)
+# step 5: --mv_n_samples 60 --mv_max_depth 1
+# step 7: --mgr_max_steps 60 --mgr_grpo_beta 0.05   (tiny GRPO pool; watch for overfit)
 # steps otherwise identical to MedQA with $LB $LB_SPLIT --teacher_id $LB_ID --task_description "$LB_DESC"
 ```
 
@@ -221,13 +227,13 @@ python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
     --mmlu_pro_normalized_cache outputs/data/mmlu_pro_normalized.jsonl \
     --train_size 0 --dev_size 0 --test_size 500 --eval_n_samples 500 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_anytime_c05" \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_binary_marginal" \
     --task_description "You are a manager agent solving multiple-choice questions across diverse academic subjects. Each question has 10 options (A-J)."
 ```
 
 **Optional in-domain training** (accepting the comparability caveat): identical
 seven steps to MedQA with `--mmlu_pro_normalized_cache ... --train_size 1800
---dev_size 200 --test_size 500`, `--n_samples 500`, `--coldstart_n_samples 300`,
+--dev_size 200 --test_size 500`, `--n_samples 500`, `--mv_n_samples 400`,
 `--mgr_max_steps 300`, under a fresh `--teacher_id`.
 
 ## 4. GPQA
@@ -246,7 +252,7 @@ python -m src.pipeline.cli eval_manager_tools \
     --base_model "$BASE_MODEL" --teacher_id "$TEACHER_ID" \
     --gpqa_normalized_cache outputs/data/gpqa_diamond_normalized.jsonl \
     --train_size 0 --dev_size 0 --test_size 198 --eval_n_samples 198 \
-    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_anytime_c05" \
+    --eval_manager_dir "outputs/manager/${TEACHER_ID}/grpo_binary_marginal" \
     --task_description "You are a manager agent solving expert-level graduate science multiple-choice questions."
 ```
 
@@ -277,12 +283,13 @@ Full copy-paste commands: EXPERIMENTS.md §8.4.
 | `export_deepseek_jsonl` / `import_deepseek_jsonl` | offline-teacher alternative to synth |
 | `train_subagent` | LoRA-SFT one advisor |
 | `eval_subagents` | JSON/schema validity gate |
-| `manager_coldstart_sft` | build + train tool-calling format (drafts + `current_draft` demonstrated) |
-| `train_manager_grpo` | GRPO; `--mgr_adc_mode --mgr_adc_variant anytime\|transition\|sum` |
+| `build_marginal_sft` | enumerate draft-conditioned counterfactual branches and select shortest successful routing traces |
+| `manager_coldstart_sft` | legacy heuristic/teacher-sequence cold start (baseline only) |
+| `train_manager_grpo` | GRPO; main protocol uses binary correctness with all auxiliary reward flags at zero |
 | `evolve_build_sft` / `train_manager_sft` / `evolve_round` | failure-recycling SFT loop |
 | `eval_manager` | no-tools probe; `--eval_sc_k K` = self-consistency baseline |
 | `eval_manager_tools` | full delegate-or-commit loop (the learned policy) |
 | `eval_manager_forced` | fixed delegation subsets → fixed-k baselines + stopping oracle |
 
-Troubleshooting, calibration/oracle analysis snippets, reward-ablation arms,
-and the full paper-experiment matrix: **[EXPERIMENTS.md](EXPERIMENTS.md)**.
+Full current protocol and failure gates:
+**[MARGINAL_VALUE_EXPERIMENTS.md](MARGINAL_VALUE_EXPERIMENTS.md)**.

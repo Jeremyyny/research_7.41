@@ -5,9 +5,9 @@ The manager is a deliberation orchestrator with three cognitive specialist tools
   - reasoner_tool: structured reasoning
   - verifier_tool: domain audit and error detection
 
-Adaptive Deliberation Control (ADC) policy:
+Draft-conditioned routing policy:
   - 0 to 3 tool calls allowed. Each tool may be called at most once.
-  - After each tool result, output DRAFT_ANSWER_<TOKEN> before deciding to continue.
+  - Before every routing or stopping decision, output DRAFT_ANSWER_<TOKEN>.
   - Stop calling tools when further help is unlikely to improve the draft answer.
   - Final answer ends with exactly one line: ANSWER_<TOKEN>
   - Manager MUST NOT emit tool-call JSON or XML in plain text content.
@@ -53,7 +53,7 @@ def build_manager_system_prompt(
     task_description: str = "",
     exploration_hint: str = "",
 ) -> str:
-    """Build the manager's system prompt with ADC deliberation policy.
+    """Build the manager's system prompt with draft-conditioned routing.
 
     Args:
         label_keys: choice keys for the current task (e.g. ["A","B","C","D"]).
@@ -76,7 +76,7 @@ def build_manager_system_prompt(
         "(e.g. current_draft=\"B\") so it audits that specific hypothesis.\n\n"
         "Deliberation policy:\n"
         "  - You may call 0 to 3 tools total. Each tool may be used at most once.\n"
-        "  - After reading each tool result, state your current best answer on a new line:\n"
+        "  - Before every call-or-stop decision, state your current best answer on a new line:\n"
         + draft_lines + "\n"
         "  - Then decide: only call another tool if it might change your draft answer.\n"
         "  - Stop when additional tools are unlikely to improve your answer.\n"
@@ -85,6 +85,7 @@ def build_manager_system_prompt(
         "Output rules:\n"
         "  - Use the native tool-calling interface. Do NOT write tool calls as text, XML, or JSON.\n"
         "  - In a turn where you call a tool, output DRAFT_ANSWER_ but NOT the final ANSWER_.\n"
+        "  - If you answer without a tool, output DRAFT_ANSWER_ immediately before the final ANSWER_.\n"
         "  - When you are ready to submit your final answer (no more tools), end with exactly:\n"
         + answer_lines + "\n"
         "  - Brief reasoning above the ANSWER_ line is allowed; nothing after it.\n"

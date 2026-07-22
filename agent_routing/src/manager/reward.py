@@ -12,7 +12,7 @@ Three reward modes:
      WARNING: when p_low < 0.5, rewards for k>=2 are INVERTED (wrong > correct).
      Only use with p_low > 0.5 (e.g. 0.6).
 
-3. ADC — Adaptive Deliberation Control (adc_mode=True):  [RECOMMENDED]
+3. ADC — Adaptive Deliberation Control (adc_mode=True):  [LEGACY ABLATION]
      Anytime-accuracy reward. Manager outputs DRAFT_ANSWER_<TOKEN> in every
      turn that calls a tool; reward is:
        +draft_bonus * (fraction of answer statements that are correct)
@@ -425,7 +425,7 @@ def build_reward_funcs(
 
     Mode priority: adc_mode > ccr_mode > binary.
 
-    ADC mode (recommended):
+    ADC mode (legacy ablation):
         Anytime per-draft correctness reward + final correctness - tool cost.
         Incentive-compatible: honest drafts are optimal (see module docstring).
 
@@ -468,12 +468,12 @@ def build_reward_funcs(
             base_correct  = bool(valid_format and no_artifacts and no_tc_in_final and pred == gt)
 
             k = int(stats["tool_calls"])
+            answer_seq = extract_answer_sequence(c, keys_list)
 
             # ---- ADC mode ----
             if adc_mode:
-                y_hat_seq = extract_answer_sequence(c, keys_list)
                 adc_r, adc_stats = _compute_adc_reward(
-                    y_hat_seq=y_hat_seq,
+                    y_hat_seq=answer_seq,
                     ground_truth=str(gt),
                     n_tools=k,
                     draft_bonus=adc_draft_bonus,
@@ -538,7 +538,16 @@ def build_reward_funcs(
                     "reward_mode": (
                         f"adc:{adc_variant}" if adc_mode else ("ccr" if ccr_mode else "binary")
                     ),
+                    "answer_sequence": [str(y) if y is not None else None for y in answer_seq],
+                    "initial_draft": (answer_seq[0] if answer_seq else pred),
                 }
+                initial = answer_seq[0] if answer_seq else pred
+                initial_ok = bool(initial is not None and initial == gt)
+                trace_entry.update({
+                    "initial_draft_correct": initial_ok,
+                    "corrected_by_tools": bool(k > 0 and initial is not None and not initial_ok and base_correct),
+                    "corrupted_by_tools": bool(k > 0 and initial_ok and not base_correct),
+                })
                 if adc_mode:
                     trace_entry.update({
                         "y_hat_seq": adc_stats.get("y_hat_seq", []),

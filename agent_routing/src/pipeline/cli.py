@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
         "import_deepseek_jsonl",
         "train_subagent",
         "train_manager_grpo",
+        "build_marginal_sft",
         "manager_coldstart_sft",
         "export_manager_coldstart_prompts",
         "import_manager_coldstart_responses",
@@ -184,12 +185,11 @@ def _parse_args() -> argparse.Namespace:
                              "MUST be >0.5 to avoid reward inversion at k>=2 (default 0.6).")
     parser.add_argument("--mgr_ccr_k_max", type=int, default=3,
                         help="CCR k_max; must match max_tool_calling_iterations (default 3).")
-    # ADC — Adaptive Deliberation Control reward (recommended, replaces CCR)
+    # ADC — legacy Adaptive Deliberation Control reward ablation
     parser.add_argument("--mgr_adc_mode", action="store_true",
-                        help="Enable ADC (Adaptive Deliberation Control) anytime reward: "
+                        help="Legacy ablation: enable ADC anytime reward: "
                              "+draft_bonus per CORRECT DRAFT_ANSWER_, final bonus, tool cost. "
-                             "Incentive-compatible (no sandbagging exploit). "
-                             "Recommended over --mgr_ccr_mode.")
+                             "Retained only for comparison with older runs.")
     parser.add_argument("--mgr_adc_cost_per_tool", type=float, default=0.05,
                         help="ADC per-tool cost subtracted from reward (default 0.05). "
                              "Encourages the manager to stop calling tools when not helpful.")
@@ -235,6 +235,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude_sft_example_ids", action="append", default=[],
                         help="JSONL path(s), comma-separated or repeated, whose example_id values are excluded from manager GRPO train rows.")
 
+    # Counterfactual marginal-value routing data
+    parser.add_argument("--mv_manager_dir", type=str, default="",
+                        help="Manager checkpoint used to generate the shared initial draft and revise counterfactual branches. Empty uses --base_model.")
+    parser.add_argument("--mv_n_samples", type=int, default=300,
+                        help="Number of training questions used for marginal-value branch collection.")
+    parser.add_argument("--mv_max_depth", type=int, default=1, choices=[1, 2, 3],
+                        help="Maximum number of distinct advisors in a forced counterfactual branch. Start with 1; use 2/3 only if the one-step oracle leaves useful headroom.")
+    parser.add_argument("--mv_max_new_tokens", type=int, default=512,
+                        help="Manager token budget for each counterfactual answer probe.")
+    parser.add_argument("--mv_temperature", type=float, default=0.0,
+                        help="Counterfactual manager sampling temperature. Keep 0 for paired, deterministic comparisons.")
+    parser.add_argument("--mv_max_commit_rescue_ratio", type=float, default=1.0,
+                        help="Cap direct-correct commit decisions per rescued decision in marginal SFT. Negative keeps all commits; 1.0 gives a balanced cold start.")
+    parser.add_argument("--mv_output_dir", type=str, default="",
+                        help="Optional output directory for counterfactual records, report, and manager_sft_marginal.jsonl.")
+
     # Evolve
     parser.add_argument("--evolve_max_fail_samples", type=int, default=1500)
     parser.add_argument("--fail_buffer_jsonl", type=str, default="",
@@ -251,6 +267,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Optional explicit output path for the SFT JSONL built by import_manager_coldstart_responses.")
     parser.add_argument("--manager_sft_train_jsonl", type=str, default="",
                         help="Optional explicit manager SFT JSONL for train_manager_sft.")
+    parser.add_argument("--manager_sft_init_adapter", type=str, default="",
+                        help="Optional existing manager adapter/full checkpoint to continue SFT from instead of restarting from --base_model.")
+    parser.add_argument("--manager_sft_output_dir", type=str, default="",
+                        help="Optional explicit output directory for train_manager_sft.")
     parser.add_argument("--manager_sft_lr", type=float, default=2e-5)
     parser.add_argument("--manager_sft_epochs", type=int, default=1)
 
@@ -646,6 +666,25 @@ def main() -> None:
         print("[EVOLVE_BUILD_SFT]", result)
         return
 
+    if args.stage == "build_marginal_sft":
+        data = _load_benchmark_splits(args)
+        train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
+        result = stages.run_build_marginal_sft(
+            ctx=ctx,
+            rows=train_rows,
+            manager_dir=(args.mv_manager_dir or None),
+            n_samples=args.mv_n_samples,
+            max_depth=args.mv_max_depth,
+            max_new_tokens=args.mv_max_new_tokens,
+            temperature=args.mv_temperature,
+            max_commit_rescue_ratio=args.mv_max_commit_rescue_ratio,
+            task_description=args.task_description,
+            output_dir=(args.mv_output_dir or None),
+            subagent_server_url=(args.subagent_server_url or None),
+        )
+        print("[BUILD_MARGINAL_SFT]", result)
+        return
+
     if args.stage == "export_manager_coldstart_prompts":
         data = _load_benchmark_splits(args)
         train_rows = _exclude_sft_rows(data["train"], args.exclude_sft_example_ids)
@@ -699,6 +738,8 @@ def main() -> None:
         result = stages.run_train_manager_sft(
             ctx=ctx,
             train_jsonl=(args.manager_sft_train_jsonl or None),
+            init_model_or_adapter=(args.manager_sft_init_adapter or None),
+            output_dir=(args.manager_sft_output_dir or None),
             epochs=args.manager_sft_epochs,
             lr=args.manager_sft_lr,
             max_seq_len=args.sft_max_seq_len,

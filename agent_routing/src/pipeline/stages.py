@@ -26,6 +26,7 @@ from ..benchmarks.mmlu_pro import load_mmlu_pro
 from ..manager.prompt import (
     build_manager_system_prompt,
     build_manager_user_message,
+    parse_draft_answer,
     parse_final_answer,
 )
 from ..subagents.prompts.extractor import build_extractor_synth_prompt
@@ -97,6 +98,9 @@ class StageContext:
 
     def evolve_dir(self) -> str:
         return os.path.join(self.manager_root, "evolve")
+
+    def marginal_value_dir(self) -> str:
+        return os.path.join(self.manager_root, "marginal_value")
 
     def fail_buffer_path(self) -> str:
         return os.path.join(self.manager_grpo_dir(), "fail_buffer.jsonl")
@@ -719,6 +723,52 @@ def run_train_manager_grpo(
     return {"manager_dir": out_dir, "fail_buffer": os.path.join(out_dir, "fail_buffer.jsonl")}
 
 
+# ---------------- Stage: counterfactual marginal-value SFT ----------------
+
+def run_build_marginal_sft(
+    ctx: StageContext,
+    rows: List[StandardRow],
+    manager_dir: Optional[str] = None,
+    n_samples: int = 300,
+    max_depth: int = 1,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    max_commit_rescue_ratio: float = 1.0,
+    task_description: str = "",
+    output_dir: Optional[str] = None,
+    subagent_server_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Collect paired counterfactual branches and build routing SFT data.
+
+    The direct answer is treated as the manager's initial draft.  Advisor
+    sequences are forced breadth-first and ground truth selects the shortest
+    sequence that actually corrects that draft.  No synthetic GT draft or
+    per-call reward is used.
+    """
+    from ..manager.marginal_value import MarginalValueConfig, build_marginal_value_sft
+
+    binding = "argument" if ctx.binding_mode == "argument" else "environment"
+    cfg = MarginalValueConfig(
+        base_model=ctx.base_model,
+        manager_dir=manager_dir or ctx.base_model,
+        rows=rows,
+        out_dir=output_dir or ctx.marginal_value_dir(),
+        extractor_adapter=ctx.adapter_path("extractor"),
+        reasoner_adapter=ctx.adapter_path("reasoner"),
+        verifier_adapter=ctx.adapter_path("verifier"),
+        seed=ctx.seed,
+        n_samples=n_samples,
+        max_depth=max_depth,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        binding_mode=binding,
+        task_description=task_description,
+        max_commit_rescue_ratio=max_commit_rescue_ratio,
+        subagent_server_url=subagent_server_url,
+    )
+    return build_marginal_value_sft(cfg)
+
+
 # --------------------- Stage: evolve build SFT ---------------------
 
 def run_evolve_build_sft(
@@ -1011,6 +1061,8 @@ def run_manager_coldstart_sft(
 def run_train_manager_sft(
     ctx: StageContext,
     train_jsonl: Optional[str] = None,
+    init_model_or_adapter: Optional[str] = None,
+    output_dir: Optional[str] = None,
     epochs: int = 1,
     lr: float = 2e-5,
     max_seq_len: int = 4096,
@@ -1028,11 +1080,12 @@ def run_train_manager_sft(
     if not os.path.exists(train_jsonl):
         raise FileNotFoundError(f"manager SFT input not found: {train_jsonl}")
 
-    out_dir = ctx.manager_sft_dir()
+    out_dir = output_dir or ctx.manager_sft_dir()
     cfg = ManagerSFTConfig(
         base_model=ctx.base_model,
         train_jsonl=train_jsonl,
         out_dir=out_dir,
+        init_model_or_adapter=init_model_or_adapter,
         seed=ctx.seed,
         max_seq_len=max_seq_len,
         learning_rate=lr,
@@ -1045,7 +1098,10 @@ def run_train_manager_sft(
         max_steps=max_steps,
     )
     train_manager_sft(cfg)
-    return {"manager_sft_dir": out_dir}
+    return {
+        "manager_sft_dir": out_dir,
+        "init_model_or_adapter": init_model_or_adapter or ctx.base_model,
+    }
 
 
 # --------------------- Stage: full evolve round ---------------------
@@ -1218,8 +1274,6 @@ def run_eval_manager(
         manager_dir = (
             ctx.manager_sft_dir() if os.path.exists(ctx.manager_sft_dir()) else ctx.manager_grpo_dir()
         )
-    if not os.path.exists(manager_dir):
-        raise FileNotFoundError(f"manager_dir not found: {manager_dir}")
     # Match the wording the manager saw at training time instead of always
     # claiming argument binding.
     binding_mode = _resolve_binding_mode(ctx, manager_dir)
@@ -1237,11 +1291,11 @@ def run_eval_manager(
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    is_full = (
-        os.path.exists(os.path.join(manager_dir, "config.json"))
-        and not os.path.exists(os.path.join(manager_dir, "adapter_config.json"))
+    is_adapter = bool(
+        os.path.isdir(manager_dir)
+        and os.path.exists(os.path.join(manager_dir, "adapter_config.json"))
     )
-    if is_full:
+    if not is_adapter:
         model = AutoModelForCausalLM.from_pretrained(
             manager_dir, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
@@ -1652,6 +1706,22 @@ def run_eval_manager_tools(
 
         pred = parse_final_answer(final_text, list(r.choices.keys()))
         correct = bool(pred is not None and pred == r.ground_truth)
+        initial_draft: Optional[str] = None
+        for event in trajectory:
+            if event.get("role") != "assistant":
+                continue
+            initial_draft = parse_draft_answer(
+                str(event.get("content") or ""), list(r.choices.keys())
+            )
+            if initial_draft is not None:
+                break
+        # A legacy/direct completion may contain only ANSWER_. Treat that
+        # submitted answer as its initial draft for conditional diagnostics.
+        if initial_draft is None and not used_tools:
+            initial_draft = pred
+        initial_draft_correct = bool(
+            initial_draft is not None and initial_draft == r.ground_truth
+        )
         if pred is not None:
             n_valid += 1
         if correct:
@@ -1671,6 +1741,10 @@ def run_eval_manager_tools(
             "ground_truth": r.ground_truth,
             "pred": pred,
             "correct": correct,
+            "initial_draft": initial_draft,
+            "initial_draft_correct": initial_draft_correct,
+            "corrected_by_tools": bool(used_tools and initial_draft is not None and not initial_draft_correct and correct),
+            "corrupted_by_tools": bool(used_tools and initial_draft_correct and not correct),
             "valid_answer": pred is not None,
             "tool_calls": len(used_tools),
             "tool_names_called": used_tools,
@@ -1679,6 +1753,9 @@ def run_eval_manager_tools(
         })
 
     n = len(sample)
+    with_draft = [r for r in rows_log if r.get("initial_draft") is not None]
+    draft_wrong = [r for r in with_draft if not r["initial_draft_correct"]]
+    draft_correct = [r for r in with_draft if r["initial_draft_correct"]]
     report = {
         "teacher_id": ctx.teacher_id,
         "manager_dir": manager_dir,
@@ -1689,6 +1766,16 @@ def run_eval_manager_tools(
         "avg_tool_calls": total_tool_calls / max(1, n),
         "tool_counts": tool_counts,
         "malformed_tool_calls": malformed_tool_calls,
+        "initial_draft_coverage": len(with_draft) / max(1, n),
+        "initial_draft_accuracy": sum(r["initial_draft_correct"] for r in with_draft) / max(1, len(with_draft)),
+        "call_rate_given_draft_wrong": sum(r["tool_calls"] > 0 for r in draft_wrong) / max(1, len(draft_wrong)),
+        "call_rate_given_draft_correct": sum(r["tool_calls"] > 0 for r in draft_correct) / max(1, len(draft_correct)),
+        "draft_conditioned_call_gap": (
+            sum(r["tool_calls"] > 0 for r in draft_wrong) / max(1, len(draft_wrong))
+            - sum(r["tool_calls"] > 0 for r in draft_correct) / max(1, len(draft_correct))
+        ),
+        "correction_rate": sum(r["corrected_by_tools"] for r in rows_log) / max(1, n),
+        "corruption_rate": sum(r["corrupted_by_tools"] for r in rows_log) / max(1, n),
         "binding_mode": binding_mode,
         "subagents": sorted(pool._agents.keys()) if hasattr(pool, "_agents") else ["remote"],
     }
