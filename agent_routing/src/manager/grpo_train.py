@@ -245,7 +245,7 @@ class ManagerGRPOConfig:
     exploration_hint: str = ""           # START-style hint injected into system prompt during training only
     clip_epsilon_high: float = 0.0       # DAPO Clip-Higher: asymmetric clip upper bound (0 = symmetric/standard)
     # Adaptive Deliberation Control reward (replaces CCR)
-    adc_mode: bool = False               # enable ADC anytime per-draft reward (recommended over ccr_mode)
+    adc_mode: bool = False               # legacy ADC reward ablation; main method uses binary reward
     adc_cost_per_tool: float = 0.05      # per-tool cost (discourages over-calling without utility)
     adc_draft_bonus: float = 0.2         # bonus per CORRECT draft answer (anytime reward)
     adc_missing_draft_penalty: float = 0.1  # penalty per tool call without an accompanying draft

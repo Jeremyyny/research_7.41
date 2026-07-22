@@ -31,7 +31,7 @@ from ..utils.io import read_jsonl, write_jsonl, write_json
 from ..utils.seed import set_seed
 
 try:
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
@@ -305,7 +305,7 @@ def _build_manager_tool_sft_rows(
                 "example_id": eid,
                 "question_hash": qhash,
                 "prompt": base_messages,
-                "response": [{"role": "assistant", "content": final_text}],
+                "response": [{"role": "assistant", "content": f"{draft_text}\n{final_text}"}],
             })
             continue
 
@@ -624,7 +624,7 @@ def build_manager_sft_from_sequences(
                 "example_id": eid,
                 "question_hash": qhash,
                 "prompt": base_messages,
-                "response": [{"role": "assistant", "content": final_text}],
+                "response": [{"role": "assistant", "content": f"{draft_text}\n{final_text}"}],
             })
             continue
 
@@ -677,6 +677,7 @@ class ManagerSFTConfig:
     base_model: str
     train_jsonl: str
     out_dir: str
+    init_model_or_adapter: Optional[str] = None
     seed: int = 42
     max_seq_len: int = 4096
     learning_rate: float = 2e-5
@@ -750,19 +751,54 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> 
 def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     set_seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if cfg.use_lora and not PEFT_AVAILABLE:
+        raise RuntimeError("peft is required when manager SFT is configured with LoRA.")
 
-    tok = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
+    init_source = cfg.init_model_or_adapter or cfg.base_model
+    tok = AutoTokenizer.from_pretrained(init_source, trust_remote_code=True)
     tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
 
     dtype = torch.bfloat16 if (cfg.bf16 and device == "cuda") else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model, torch_dtype=dtype, trust_remote_code=True
-    ).to(device)
+    is_adapter_init = bool(
+        cfg.init_model_or_adapter
+        and os.path.isdir(cfg.init_model_or_adapter)
+        and os.path.exists(os.path.join(cfg.init_model_or_adapter, "adapter_config.json"))
+    )
+    is_full_init = bool(
+        cfg.init_model_or_adapter
+        and os.path.isdir(cfg.init_model_or_adapter)
+        and os.path.exists(os.path.join(cfg.init_model_or_adapter, "config.json"))
+        and not is_adapter_init
+    )
+    if is_adapter_init:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("peft is required to continue SFT from a manager adapter.")
+        base = AutoModelForCausalLM.from_pretrained(
+            cfg.base_model, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
+        model = PeftModel.from_pretrained(
+            base, cfg.init_model_or_adapter, is_trainable=cfg.use_lora
+        ).to(device)
+        if not cfg.use_lora:
+            model = model.merge_and_unload().to(device)
+        print(f"[MANAGER_SFT] continuing from adapter -> {cfg.init_model_or_adapter}")
+    elif is_full_init:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.init_model_or_adapter, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
+        print(f"[MANAGER_SFT] continuing from full checkpoint -> {cfg.init_model_or_adapter}")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.base_model, torch_dtype=dtype, trust_remote_code=True
+        ).to(device)
     model.config.use_cache = False
+    if not cfg.use_lora:
+        for param in model.parameters():
+            param.requires_grad_(True)
 
-    if cfg.use_lora and PEFT_AVAILABLE:
+    if cfg.use_lora and PEFT_AVAILABLE and not is_adapter_init:
         candidate = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         present = {n.split(".")[-1] for n, _ in model.named_modules()}
         target = [m for m in candidate if m in present] or ["q_proj", "v_proj"]

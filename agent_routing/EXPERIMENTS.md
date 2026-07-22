@@ -1,5 +1,10 @@
 # Experiment Plan — Learning When to Commit (8B, 4× GPU cluster)
 
+> **Historical ADC plan.** The current main method uses counterfactual
+> marginal-value SFT followed by binary-outcome GRPO. Follow
+> [MARGINAL_VALUE_EXPERIMENTS.md](MARGINAL_VALUE_EXPERIMENTS.md) for all new
+> runs. Keep the ADC commands below only for failure-analysis ablations.
+
 Full execution plan for the three research questions:
 
 - **RQ1** Does delegation buy accuracy — and is it structure or distillation?
